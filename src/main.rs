@@ -1,87 +1,61 @@
+//!
+//! The application binary.
+//!
+
 #![feature(generators, generator_trait)]
 
-extern crate carrier;
-extern crate osaka;
-extern crate tinylogger;
-extern crate log;
-extern crate prost;
+mod broker;
+mod error;
+mod http;
+mod state;
 
-use carrier::error::Error;
-use log::{
-    info
-};
-use osaka::{
-    osaka,
-};
-use std::env;
+use std::{env, io, num};
 
+use actix_web::{middleware::Logger, server, App};
+use log::*;
 
-pub fn main() -> Result<(), Error> {
-    if let Err(_) = env::var("RUST_LOG") {
-        env::set_var("RUST_LOG", "info");
-    }
-    tinylogger::init().ok();
+use crate::{broker::Broker, state::State};
 
-    let poll  = osaka::Poll::new();
-    main_async(poll).run()
+#[derive(Debug)]
+enum Error {
+    MissingEnvironmentVariable(&'static str, env::VarError),
+    InvalidEnvironmentVariable(&'static str, num::ParseIntError),
+    BrokerError(carrier::error::Error),
+    HttpError(io::Error),
 }
 
+///
+/// RUST_LOG='carrier=info,actix_web=info,conduit2=info'
+///
+fn main() -> Result<(), Error> {
+    env_logger::Builder::from_default_env()
+        .default_format_timestamp_nanos(true)
+        .init();
 
-#[osaka]
-fn handler(poll: osaka::Poll, mut stream: carrier::endpoint::Stream) {
-    use prost::Message;
+    let port = env::var("HTTP_PORT")
+        .map_err(|error| Error::MissingEnvironmentVariable("HTTP_PORT", error))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|error| Error::InvalidEnvironmentVariable("HTTP_PORT", error))?;
 
-    let m = osaka::sync!(stream);
-    let headers = carrier::headers::Headers::decode(&m).unwrap();
-    info!("pubres: {:?}", headers);
+    let broker = Broker::create().map_err(Error::BrokerError)?;
+    let state = State::new(broker);
 
-    let sc = carrier::proto::SubscribeChange::decode(osaka::sync!(stream)).unwrap();
+    let address = format!("{}:{}", "0.0.0.0", port);
+    let log_format = "%a %r => %s (%bB sent)";
 
-    match sc.m {
-        Some(carrier::proto::subscribe_change::M::Publish(carrier::proto::Publish{identity, xaddr})) => {
-        },
-        Some(carrier::proto::subscribe_change::M::Unpublish(carrier::proto::Unpublish{identity})) => {
-        }
-        Some(carrier::proto::subscribe_change::M::Supersede(_)) => {
-            panic!("subscriber superseded");
-        },
-        None =>(),
-    }
-
-}
-
-#[osaka]
-pub fn main_async(poll: osaka::Poll) -> Result<(), Error> {
-
-    let shadow : carrier::identity::Address = "oT5kQdir3RqedEtVkvqcJA13Ze8czCoobBoCMjSj7MDPuSj".parse().unwrap();
-
-    let config  = carrier::config::load()?;
-
-    let mut ep = carrier::endpoint::EndpointBuilder::new(&config)?.connect(poll.clone());
-    let mut ep = osaka::sync!(ep)?;
-
-    let broker = ep.broker();
-    ep.open(
-        broker,
-        carrier::headers::Headers::with_path("/carrier.broker.v1/broker/subscribe"),
-        |poll, mut stream| {
-            stream.message(carrier::proto::SubscribeRequest {
-                shadow: shadow.as_bytes().to_vec(),
-                filter: Vec::new(),
-            });
-            handler(poll, stream)
-        },
-        );
-
-    loop {
-        match osaka::sync!(ep)? {
-            carrier::endpoint::Event::Disconnect{..} => (),
-            carrier::endpoint::Event::OutgoingConnect(_) => (),
-            carrier::endpoint::Event::IncommingConnect(q) => {
-                info!("ignoring incomming connect {}", q.identity);
-            }
-        };
-    }
+    server::new(move || {
+        App::with_state(state.clone())
+            .middleware(Logger::new(log_format))
+            .configure(http::router)
+    })
+    .bind(&address)
+    .map(move |server| {
+        info!("HTTP server has been started at {}", address);
+        server
+    })
+    .map_err(Error::HttpError)?
+    .run();
 
     Ok(())
 }
