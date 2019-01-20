@@ -12,6 +12,16 @@ pub enum Error {
     MissingParameter(&'static str),
     #[fail(display = "Identity {} parsing error: {}", _0, _1)]
     IdentityParsingError(String, carrier::error::Error),
+    #[fail(display = "Internal error: {}", _0)]
+    InternalErrorActix(actix::MailboxError),
+    #[fail(display = "Internal error: {}", _0)]
+    InternalErrorCarrier(carrier::error::Error),
+}
+
+impl From<actix::MailboxError> for Error {
+    fn from(error: actix::MailboxError) -> Self {
+        Error::InternalErrorActix(error)
+    }
 }
 
 impl ResponseError for Error {
@@ -20,6 +30,12 @@ impl ResponseError for Error {
             Error::MissingParameter(..) => HttpResponse::BadRequest().json(JsonError::new(self)),
             Error::IdentityParsingError(..) => {
                 HttpResponse::BadRequest().json(JsonError::new(self))
+            }
+            Error::InternalErrorActix(..) => {
+                HttpResponse::InternalServerError().json(JsonError::new(self))
+            }
+            Error::InternalErrorCarrier(..) => {
+                HttpResponse::InternalServerError().json(JsonError::new(self))
             }
         }
     }

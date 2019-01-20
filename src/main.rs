@@ -11,17 +11,15 @@ mod state;
 
 use std::{env, io, num};
 
-use actix_web::{middleware::Logger, server, App};
+use actix_web::middleware::Logger;
 use log::*;
-
-use crate::{broker::Broker, state::State};
 
 #[derive(Debug)]
 enum Error {
     MissingEnvironmentVariable(&'static str, env::VarError),
     InvalidEnvironmentVariable(&'static str, num::ParseIntError),
-    BrokerError(carrier::error::Error),
     HttpError(io::Error),
+    ActixSystem(i32),
 }
 
 ///
@@ -38,14 +36,16 @@ fn main() -> Result<(), Error> {
         .parse()
         .map_err(|error| Error::InvalidEnvironmentVariable("HTTP_PORT", error))?;
 
-    let broker = Broker::create().map_err(Error::BrokerError)?;
-    let state = State::new(broker);
+    let system = actix::System::new(env!("CARGO_PKG_NAME"));
+    let poll = osaka::Poll::new();
+
+    let broker = actix::Arbiter::start(move |_| broker::BrokerActor::new(poll));
+    let state = crate::state::State::new(broker);
 
     let address = format!("{}:{}", "0.0.0.0", port);
     let log_format = "%a %r => %s (%bB sent)";
-
-    server::new(move || {
-        App::with_state(state.clone())
+    actix_web::server::new(move || {
+        actix_web::App::with_state(state.clone())
             .middleware(Logger::new(log_format))
             .configure(http::router)
     })
@@ -55,7 +55,12 @@ fn main() -> Result<(), Error> {
         server
     })
     .map_err(Error::HttpError)?
-    .run();
+    .start();
 
-    Ok(())
+    let code = system.run();
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(Error::ActixSystem(code))
+    }
 }

@@ -11,6 +11,8 @@ failure             = "0.1.5"
 serde               = "1.0.84"
 serde_json          = "1.0.36"
 serde_derive        = "1.0.84"
-carrier             = { path = "../carrier2" }
+carrier             = { git = "https://github.com/aep/cr2" }
 osaka               = "0.2"
+actix               = "0.7.9"
 actix-web           = "0.7.18"
+futures             = "0.1.25"

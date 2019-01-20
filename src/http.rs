@@ -1,11 +1,12 @@
 //!
-//! The HTTP router.
+//! The HTTP router and handlers.
 //!
 
-use actix_web::{App, HttpRequest, HttpResponse};
+use actix_web::{App, AsyncResponder, FutureResponse, HttpRequest, HttpResponse};
+use futures::future::Future;
 use serde_derive::Serialize;
 
-use crate::{error::Error, state::State};
+use crate::{broker::{BrokerActorMessage, DeviceStatus}, error::Error, state::State};
 
 pub fn router(application: App<State>) -> App<State> {
     application.scope("/api/v1", |scope| {
@@ -24,7 +25,7 @@ impl StatusResponse {
     }
 }
 
-fn status(request: HttpRequest<State>) -> Result<HttpResponse, Error> {
+fn status(request: HttpRequest<State>) -> Result<FutureResponse<HttpResponse, Error>, Error> {
     let state: &State = request.state();
 
     let identity = request
@@ -36,10 +37,21 @@ fn status(request: HttpRequest<State>) -> Result<HttpResponse, Error> {
         .parse()
         .map_err(|error| Error::IdentityParsingError(identity, error))?;
 
-    let result = match state.broker_connect(identity) {
-        Ok(..) => StatusResponse::new(format!("Online")),
-        Err(..) => StatusResponse::new(format!("Offline")),
-    };
-
-    Ok(HttpResponse::Ok().json(result))
+    Ok(state
+        .broker
+        .send(BrokerActorMessage(identity))
+        .from_err()
+        .and_then(|result| {
+            result
+                .map_err(Error::InternalErrorCarrier)
+                .and_then(|data| {
+                    let result = match data {
+                        DeviceStatus::Online => StatusResponse::new(format!("Online")),
+                        DeviceStatus::Offline => StatusResponse::new(format!("Offline")),
+                        DeviceStatus::Unknown => StatusResponse::new(format!("Unknown")),
+                    };
+                    Ok(HttpResponse::Ok().json(result))
+                })
+        })
+        .responder())
 }
