@@ -18,7 +18,7 @@ use log::*;
 enum Error {
     MissingEnvironmentVariable(&'static str, env::VarError),
     InvalidEnvironmentVariable(&'static str, num::ParseIntError),
-    HttpError(io::Error),
+    ActixHttp(io::Error),
     ActixSystem(i32),
 }
 
@@ -54,7 +54,7 @@ fn main() -> Result<(), Error> {
         info!("HTTP server has been started at {}", address);
         server
     })
-    .map_err(Error::HttpError)?
+    .map_err(Error::ActixHttp)?
     .start();
 
     let code = system.run();

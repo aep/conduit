@@ -46,9 +46,9 @@ fn status(request: HttpRequest<State>) -> Result<FutureResponse<HttpResponse, Er
                 .map_err(Error::InternalErrorCarrier)
                 .and_then(|data| {
                     let result = match data {
-                        DeviceStatus::Online => StatusResponse::new(format!("Online")),
-                        DeviceStatus::Offline => StatusResponse::new(format!("Offline")),
-                        DeviceStatus::Unknown => StatusResponse::new(format!("Unknown")),
+                        DeviceStatus::Online => StatusResponse::new("Online".to_string()),
+                        DeviceStatus::Offline => StatusResponse::new("Offline".to_string()),
+                        DeviceStatus::Unknown => StatusResponse::new("Unknown".to_string()),
                     };
                     Ok(HttpResponse::Ok().json(result))
                 })
