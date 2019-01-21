@@ -5,25 +5,77 @@ extern crate osaka;
 extern crate tinylogger;
 extern crate log;
 extern crate prost;
+extern crate actix_web;
+extern crate mio_extras;
+#[macro_use]
+extern crate lazy_static;
+extern crate serde;
+#[macro_use]
+extern crate serde_derive;
 
-use carrier::error::Error;
+
+use mio_extras::channel;
+use actix_web::{http, server, App, Path, Responder, State};
+use std::thread;
+use carrier::{
+    error::Error,
+};
 use log::{
     info
 };
 use osaka::{
+    mio,
     osaka,
+    Future,
+    FutureResult,
 };
 use std::env;
+use std::sync::mpsc;
+use std::collections::HashMap;
 
 
-pub fn main() -> Result<(), Error> {
+
+#[derive(Serialize)]
+pub struct ApiResponse {
+    pub identity: String,
+    pub connectok: bool,
+}
+
+#[derive(Clone)]
+struct MyState {
+    tx: channel::Sender<(carrier::Identity, mpsc::Sender<ApiResponse>)>,
+}
+
+
+fn index(state: State<MyState>, info: Path<String>) -> impl Responder {
+    let (tx, rx) = mpsc::channel();
+    let identity : carrier::Identity = info.parse().unwrap();
+    state.tx.send((identity, tx)).unwrap();
+    let r = rx.recv().unwrap();
+    serde_json::to_string(&r).unwrap()
+
+}
+
+pub fn main() {
     if let Err(_) = env::var("RUST_LOG") {
         env::set_var("RUST_LOG", "info");
     }
     tinylogger::init().ok();
 
-    let poll  = osaka::Poll::new();
-    main_async(poll).run()
+
+    let (tx, rx) = channel::channel();
+
+    thread::spawn(move || {
+        let poll  = osaka::Poll::new();
+        main_async(poll, rx).run().unwrap();
+    });
+
+    let state = MyState{tx};
+    server::new(
+        move || App::with_state(state.clone())
+            .route("/{id}/info.json", http::Method::GET, index))
+        .bind("0.0.0.0:8084").unwrap()
+        .run();
 }
 
 
@@ -51,7 +103,10 @@ fn handler(poll: osaka::Poll, mut stream: carrier::endpoint::Stream) {
 }
 
 #[osaka]
-pub fn main_async(poll: osaka::Poll) -> Result<(), Error> {
+pub fn main_async(poll: osaka::Poll, info_req: channel::Receiver<(carrier::Identity, mpsc::Sender<ApiResponse>)>) -> Result<(), Error> {
+
+
+    let mut open_connects = HashMap::new();
 
     let shadow : carrier::identity::Address = "oT5kQdir3RqedEtVkvqcJA13Ze8czCoobBoCMjSj7MDPuSj".parse().unwrap();
 
@@ -73,12 +128,42 @@ pub fn main_async(poll: osaka::Poll) -> Result<(), Error> {
         },
         );
 
+
+    let t1 = poll
+        .register(&info_req , mio::Ready::readable(), mio::PollOpt::level())
+        .unwrap();
+    let yy = poll.again(t1, None);
+
+
     loop {
-        match osaka::sync!(ep)? {
-            carrier::endpoint::Event::Disconnect{..} => (),
-            carrier::endpoint::Event::OutgoingConnect(_) => (),
-            carrier::endpoint::Event::IncommingConnect(q) => {
+        match info_req.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => (),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Ok(v) => {
+                info!("got req for {}", v.0);
+                ep.connect(v.0.clone())?;
+                open_connects.insert(v.0, (v.1, ));
+            }
+        };
+
+        match ep.poll() {
+            FutureResult::Done(Ok(carrier::endpoint::Event::Disconnect{..})) => (),
+            FutureResult::Done(Ok(carrier::endpoint::Event::OutgoingConnect(q))) => {
+                if let Some(v) = open_connects.remove(&q.identity) {
+                    info!("connect res for open connect");
+                    v.0.send(ApiResponse{
+                        identity: format!("{}", q.identity),
+                        connectok: q.cr.is_some(),
+                    }).unwrap();
+                }
+            },
+            FutureResult::Done(Ok(carrier::endpoint::Event::IncommingConnect(q))) => {
                 info!("ignoring incomming connect {}", q.identity);
+            },
+            FutureResult::Done(Err(e)) => return Err(e),
+            FutureResult::Again(mut y) => {
+                y.merge(yy.clone());
+                yield y;
             }
         };
     }
