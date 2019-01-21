@@ -49,10 +49,27 @@ struct MyState {
 
 fn index(state: State<MyState>, info: Path<String>) -> impl Responder {
     let (tx, rx) = mpsc::channel();
-    let identity : carrier::Identity = info.parse().unwrap();
-    state.tx.send((identity, tx)).unwrap();
-    let r = rx.recv().unwrap();
-    serde_json::to_string(&r).unwrap()
+    let r = info.parse()
+        .map_err(|e|format!("{}",e))
+        .and_then(|identity : carrier::Identity|{
+            state.tx
+                .send((identity, tx))
+                .map_err(|e|format!("{}",e))
+                .and_then(|_|{
+                    rx.recv()
+                        .map_err(|e|format!("{}",e))
+                        .and_then(|r|{
+                            serde_json::to_string(&r)
+                                .map_err(|e|format!("{}",e))
+                        })
+                })
+
+        });
+
+    match r {
+        Ok(v) => v,
+        Err(v) => format!("{{\"error\": \"{}\" }}", v),
+    }
 
 }
 
@@ -153,7 +170,10 @@ pub fn main_async(poll: osaka::Poll, info_req: channel::Receiver<(carrier::Ident
                     info!("connect res for open connect");
                     v.0.send(ApiResponse{
                         identity: format!("{}", q.identity),
-                        connectok: q.cr.is_some(),
+                        connectok: match q.cr {
+                            None => false,
+                            Some(cr) => cr.ok,
+                        },
                     }).unwrap();
                 }
             },
