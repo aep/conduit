@@ -1,29 +1,23 @@
 [package]
-name = "conduit2"
+name = "conduit-scn"
 version = "0.1.0"
 authors = ["Arvid E. Picciani <aep@exys.org>"]
 edition = "2018"
 
 [dependencies]
-tinylogger          = "0.1"
-carrier             = {path ="../carrier2"}
-osaka               = "0.2"
+carrier             = {path ="/home/aep/proj/devguard/carrier2"}
+osaka               = "0.2.7"
 sha2                = "0.7"
 log                 = "0.4"
 prost               = "0.4.0"
+env_logger          = "0.6.0"
+redis               = "0.9.0"
+redis_cluster_rs    = "0.1.5"
+hwaddr              = { version = "0.1.5", features = ["database"] }
+actix-web           = "0.7.18"
 mio-extras          = "2.0.5"
 
-actix               = "0.7.9"
-actix-web           = "0.7.18"
-lazy_static         = "1.2.0"
-serde               = "1.0.60"
-serde_derive        = "1.0.60"
-serde_json          = "1.0"
 
-
-
-
-[patch.crates-io]
-osaka           = { path = '/home/aep/proj/osaka/osaka'}
-osaka-macros    = { path = '/home/aep/proj/osaka/osaka-macros'}
-osaka-dns       = { path = '/home/aep/proj/osaka/osaka-dns'}
+serde           = "1.0.87"
+serde_derive    = "1.0.87"
+serde_json      = "1.0.38"

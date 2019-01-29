@@ -1,192 +1,285 @@
 #![feature(generators, generator_trait)]
 
 extern crate carrier;
+extern crate env_logger;
 extern crate osaka;
-extern crate tinylogger;
+
 extern crate log;
 extern crate prost;
+extern crate redis;
+extern crate redis_cluster_rs;
+
+extern crate serde;
+extern crate serde_derive;
+extern crate serde_json;
+extern crate hwaddr;
 extern crate actix_web;
 extern crate mio_extras;
-#[macro_use]
-extern crate lazy_static;
-extern crate serde;
-#[macro_use]
-extern crate serde_derive;
 
-
-use mio_extras::channel;
+use carrier::{error::Error, identity, util::defer, conduit::Conduit, config};
+use log::{info, warn};
+use osaka::{osaka, FutureResult};
+use prost::Message;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::env;
+use std::time::{Duration, Instant};
+use redis::Commands;
+use std::sync::Arc;
+use serde_derive::{Serialize, Deserialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 use actix_web::{http, server, App, Path, Responder, State};
 use std::thread;
-use carrier::{
-    error::Error,
-};
-use log::{
-    info
-};
-use osaka::{
-    mio,
-    osaka,
-    Future,
-    FutureResult,
-};
-use std::env;
-use std::sync::mpsc;
-use std::collections::HashMap;
+use mio_extras::channel;
+use osaka::Future;
 
+#[derive(Deserialize, Serialize, Debug)]
+pub struct OdhcpHost {
+    pub m : String,
+    pub ip: String,
+    pub l:  String,
+    pub n:  String,
+}
 
+#[derive(Deserialize, Debug)]
+pub struct Odhcp{
+    private: Vec<OdhcpHost>,
+    public:  Vec<OdhcpHost>,
+}
 
-#[derive(Serialize)]
-pub struct ApiResponse {
-    pub identity: String,
-    pub connectok: bool,
+mod uitypes;
+
+pub struct HttpApiCall {
+    pub identity:   identity::Identity,
+    pub headers:    carrier::headers::Headers,
 }
 
 #[derive(Clone)]
 struct MyState {
-    tx: channel::Sender<(carrier::Identity, mpsc::Sender<ApiResponse>)>,
+    tx: channel::Sender<HttpApiCall>,
 }
 
-
-fn index(state: State<MyState>, info: Path<String>) -> impl Responder {
-    let (tx, rx) = mpsc::channel();
-    let r = info.parse()
-        .map_err(|e|format!("{}",e))
-        .and_then(|identity : carrier::Identity|{
-            state.tx
-                .send((identity, tx))
-                .map_err(|e|format!("{}",e))
-                .and_then(|_|{
-                    rx.recv()
-                        .map_err(|e|format!("{}",e))
-                        .and_then(|r|{
-                            serde_json::to_string(&r)
-                                .map_err(|e|format!("{}",e))
-                        })
-                })
-
-        });
-
-    match r {
-        Ok(v) => v,
-        Err(v) => format!("{{\"error\": \"{}\" }}", v),
+fn via(state: State<MyState>, p: Path<(String, String)>) -> impl Responder {
+    if let Ok(identity) = p.0.parse() {
+        state.tx.send(HttpApiCall{
+            identity,
+            headers: carrier::headers::Headers::with_path("/v1/assemble"),
+        }).unwrap();
+        String::from("{\"ok\": true}")
+    } else {
+        String::from("{\"ok\": false}")
     }
-
 }
 
-pub fn main() {
+
+
+#[osaka]
+pub fn main() -> Result<(), Error> {
     if let Err(_) = env::var("RUST_LOG") {
         env::set_var("RUST_LOG", "info");
     }
-    tinylogger::init().ok();
-
+    env_logger::init();
 
     let (tx, rx) = channel::channel();
-
-    thread::spawn(move || {
-        let poll  = osaka::Poll::new();
-        main_async(poll, rx).run().unwrap();
+    let state = MyState{tx};
+    thread::spawn(move ||{
+        server::new(
+            move || App::with_state(state.clone())
+            .route("/via/{identity}/{tail:.*}", http::Method::POST, via))
+            .bind("0.0.0.0:8052").unwrap()
+            .run();
     });
 
-    let state = MyState{tx};
-    server::new(
-        move || App::with_state(state.clone())
-            .route("/{id}/info.json", http::Method::GET, index))
-        .bind("0.0.0.0:8084").unwrap()
-        .run();
-}
+    let redis_url = env::var("REDIS").unwrap_or("redis://127.0.0.1/".to_string());
+    let redis_client = redis_cluster_rs::Client::open(vec![redis_url.as_str()]).unwrap();
+    let redis_  = Arc::new(redis_client.get_connection().expect("redis"));
 
 
-#[osaka]
-fn handler(poll: osaka::Poll, mut stream: carrier::endpoint::Stream) {
-    use prost::Message;
+    let config = config::load().unwrap();
+    let poll = osaka::Poll::new();
+    let mut conduit = Conduit::new(poll.clone(), config);
+    let mut conduit = osaka::sync!(conduit)?;
 
-    let m = osaka::sync!(stream);
-    let headers = carrier::headers::Headers::decode(&m).unwrap();
-    info!("pubres: {:?}", headers);
+    let redis = redis_.clone();
+    conduit.schedule_raw(
+        Duration::from_secs(10),
+        carrier::headers::Headers::with_path("/v1/unixbus"),
+        move |identity: &carrier::identity::Identity, msg: Vec<u8>| {
+            let msg = String::from_utf8_lossy(&msg);
+            let msg : Vec<&str> = msg.split_terminator("\n").collect();
+            if msg.len() > 1 && msg[0] == "/odhcpd"{
+                let msg = msg[1..].join("\n");
+                match serde_json::from_str::<Odhcp>(&msg) {
+                    Ok(v) => {
+                        println!("{:?}", v);
+                        for v in v.public{
+                            let key = format!("{}:dhcp:{}", identity, v.m);
+                            let l = v.l.parse().unwrap_or(60000);
+                            let _ : () = redis.hset_multiple(&key, &[
+                                ("mac",     v.m),
+                                ("ip",      v.ip),
+                                ("lease",   v.l),
+                                ("name",    v.n),
+                                ("zone",    "private".to_string()),
+                            ]).unwrap();
+                            let _ : () = redis.expire(&key, l).unwrap();
+                        }
+                        for v in v.private {
+                            let key = format!("{}:dhcp:{}", identity, v.m);
+                            let l = v.l.parse().unwrap_or(60000);
+                            let _ : () = redis.hset_multiple(&key, &[
+                                ("mac",     v.m),
+                                ("ip",      v.ip),
+                                ("lease",   v.l),
+                                ("name",    v.n),
+                                ("zone",    "private".to_string()),
+                            ]).unwrap();
+                            let _ : () = redis.expire(&key, l).unwrap();
+                        }
+                    }
+                    Err(e) => {
+                        println!("{}", e);
+                    }
+                }
+            }
 
-    let sc = carrier::proto::SubscribeChange::decode(osaka::sync!(stream)).unwrap();
-
-    match sc.m {
-        Some(carrier::proto::subscribe_change::M::Publish(carrier::proto::Publish{identity, xaddr})) => {
-        },
-        Some(carrier::proto::subscribe_change::M::Unpublish(carrier::proto::Unpublish{identity})) => {
+            println!("{} => {:#?}", identity, msg);
         }
-        Some(carrier::proto::subscribe_change::M::Supersede(_)) => {
-            panic!("subscriber superseded");
-        },
-        None =>(),
-    }
-
-}
-
-#[osaka]
-pub fn main_async(poll: osaka::Poll, info_req: channel::Receiver<(carrier::Identity, mpsc::Sender<ApiResponse>)>) -> Result<(), Error> {
+    );
 
 
-    let mut open_connects = HashMap::new();
+    let redis = redis_.clone();
+    conduit.schedule(
+        Duration::from_secs(10),
+        carrier::headers::Headers::with_path("/v1/netsurvey"),
+        move |identity: &carrier::identity::Identity, msg: carrier::proto::NetSurvey| {
 
-    let shadow : carrier::identity::Address = "oT5kQdir3RqedEtVkvqcJA13Ze8czCoobBoCMjSj7MDPuSj".parse().unwrap();
+            let mut stations = HashMap::new();
 
-    let config  = carrier::config::load()?;
+            for i  in &msg.wifi {
+                for st in &i.stations {
 
-    let mut ep = carrier::endpoint::EndpointBuilder::new(&config)?.connect(poll.clone());
-    let mut ep = osaka::sync!(ep)?;
+                    let hwa = st.address.replace(":", "");
 
-    let broker = ep.broker();
-    ep.open(
-        broker,
-        carrier::headers::Headers::with_path("/carrier.broker.v1/broker/subscribe"),
-        |poll, mut stream| {
-            stream.message(carrier::proto::SubscribeRequest {
-                shadow: shadow.as_bytes().to_vec(),
-                filter: Vec::new(),
-            });
-            handler(poll, stream)
-        },
-        );
+                    let key = format!("{}:dhcp:{}", identity, hwa);
+                    let ip = redis.hget(&key, "ip").ok();
+                    let host_name = redis.hget(&key, "name").ok();
 
+
+                    let hwa : Vec<u8> = hwa.as_bytes().chunks(2).map(|b|u8::from_str_radix(&String::from_utf8_lossy(b),16).unwrap_or(0)).collect();
+                    let hwa = hwaddr::HwAddr::from(&hwa[..]);
+
+
+                    let station = uitypes::Station {
+                        mac:    st.address.clone(),
+                        vendor: hwa.producer().map(|p|p.name.to_string()),
+                        ip,
+                        host_name,
+                        signal: st.signal.get(0).cloned(),
+                        signal_avg: st.signal_avg.get(0).cloned(),
+                        radio: if i.name.contains("-g") {
+                            Some("g".to_string())
+                        } else if i.name.contains("-a") {
+                            Some("a".to_string())
+                        } else {
+                            None
+                        }
+                    };
+
+                    let zone : Vec<&str> = i.name.split("-").collect();;
+                    let zone = if zone.len() == 3 {
+                        zone[1].to_string()
+                    } else {
+                        "other".to_string()
+                    };
+
+                    stations.entry(zone).or_insert(Vec::new()).push(station);
+
+
+                }
+            }
+
+            let _ : () = redis.hset(format!("{}", identity), "stations", serde_json::to_string(&stations).unwrap()).unwrap();
+
+            let t = format!(r#"{{"timestamp":{}, "state": "up", "carrier": true}}"#,
+                            SystemTime::now().duration_since(UNIX_EPOCH)
+                            .expect("Time went backwards")
+                            .as_secs()
+                            );
+            let _ : () = redis.hset(format!("{}", identity), "up", &t).unwrap();
+            println!("{} => {:#?}", identity, msg);
+        }
+    );
+
+
+    /*
+    let redis = redis_.clone();
+    conduit.schedule(
+        Duration::from_secs(10),
+        carrier::headers::Headers::with_path("/v1/sysinfo"),
+        move |identity: &carrier::identity::Identity, msg: carrier::proto::Sysinfo| {
+            println!("{} => {:#?}", identity, msg);
+
+            if let Some(sw0) =  msg.switch.get(0) {
+                let mut switch  = HashMap::new();
+
+                for port in &sw0.ports {
+                    switch.insert(format!("{}", port.port), uitypes::SwitchPort{
+                        speed:      port.speed.clone(),
+                        link:       {if port.link { "up" } else {"down"}}.into(),
+                        gateway:    false,
+                    });
+                }
+
+                let mut iproute = HashMap::new();
+
+                let net = uitypes::Net{
+                    switch,
+                    iproute,
+                };
+
+                let _ : () = redis.hset(format!("{}", identity), "net", serde_json::to_string(&net).unwrap()).unwrap();
+            }
+        }
+    );
+    */
 
     let t1 = poll
-        .register(&info_req , mio::Ready::readable(), mio::PollOpt::level())
+        .register(&rx, osaka::mio::Ready::readable(), osaka::mio::PollOpt::level())
         .unwrap();
     let yy = poll.again(t1, None);
 
 
+
     loop {
-        match info_req.try_recv() {
+        let mut y = match conduit.poll() {
+            FutureResult::Done(r) => return r,
+            FutureResult::Again(y) => y,
+        };
+
+        match rx.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Empty) => (),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             Ok(v) => {
-                info!("got req for {}", v.0);
-                ep.connect(v.0.clone())?;
-                open_connects.insert(v.0, (v.1, ));
-            }
-        };
+                println!("calling {:?} => {:?}", v.identity, v.headers);
+                conduit.call(v.identity, v.headers, move |identity: &carrier::identity::Identity, msg: carrier::proto::Empty| {
 
-        match ep.poll() {
-            FutureResult::Done(Ok(carrier::endpoint::Event::Disconnect{..})) => (),
-            FutureResult::Done(Ok(carrier::endpoint::Event::OutgoingConnect(q))) => {
-                if let Some(v) = open_connects.remove(&q.identity) {
-                    info!("connect res for open connect");
-                    v.0.send(ApiResponse{
-                        identity: format!("{}", q.identity),
-                        connectok: match q.cr {
-                            None => false,
-                            Some(cr) => cr.ok,
-                        },
-                    }).unwrap();
-                }
-            },
-            FutureResult::Done(Ok(carrier::endpoint::Event::IncommingConnect(q))) => {
-                info!("ignoring incomming connect {}", q.identity);
-            },
-            FutureResult::Done(Err(e)) => return Err(e),
-            FutureResult::Again(mut y) => {
-                y.merge(yy.clone());
-                yield y;
+                });
+
             }
-        };
+        }
+
+
+        y.merge(yy.clone());
+        yield y;
     }
 
     Ok(())
 }
+
+
+
+
+
+
+
