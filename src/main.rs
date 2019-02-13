@@ -15,6 +15,8 @@ extern crate serde_json;
 extern crate hwaddr;
 extern crate actix_web;
 extern crate mio_extras;
+extern crate mosquitto_client as mosq;
+
 
 use carrier::{error::Error, identity, util::defer, conduit::Conduit, config};
 use log::{info, warn};
@@ -32,6 +34,7 @@ use actix_web::{http, server, App, Path, Responder, State};
 use std::thread;
 use mio_extras::channel;
 use osaka::Future;
+use mosq::Mosquitto;
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct OdhcpHost {
@@ -56,14 +59,25 @@ pub struct HttpApiCall {
 
 #[derive(Clone)]
 struct MyState {
-    tx: channel::Sender<HttpApiCall>,
+    tx:     channel::Sender<HttpApiCall>,
+    mqtt:   Mosquitto,
 }
 
-fn via(state: State<MyState>, p: Path<(String, String)>) -> impl Responder {
-    if let Ok(identity) = p.0.parse() {
+#[derive(Deserialize)]
+struct PostSysupgrade {
+    url:    String,
+    sha256: String,
+}
+
+fn healthcheck(_state: State<MyState>) -> impl Responder {
+    String::from("{\"ok\": true}")
+}
+
+fn assimilate(state: State<MyState>, p: Path<(String)>) -> impl Responder {
+    if let Ok(identity) = p.parse() {
         state.tx.send(HttpApiCall{
             identity,
-            headers: carrier::headers::Headers::with_path("/v1/assemble"),
+            headers: carrier::headers::Headers::with_path("/v1/assimilate"),
         }).unwrap();
         String::from("{\"ok\": true}")
     } else {
@@ -71,6 +85,30 @@ fn via(state: State<MyState>, p: Path<(String, String)>) -> impl Responder {
     }
 }
 
+fn sysupgrade(state: State<MyState>, p: Path<(String)>, s: actix_web::Json<PostSysupgrade>) -> impl Responder {
+    if let Ok(identity) = p.parse() {
+
+        let mut headers = carrier::headers::Headers::with_path("/v1/sysupgrade");
+        headers.add("url".into(), s.url.as_bytes().to_vec());
+        headers.add("sha256".into(), s.sha256.as_bytes().to_vec());
+
+
+        state.mqtt.publish(
+            &format!("/matriarch/{}/ota/state", identity),
+            br#"
+                "state": "upgrading"
+            "#, 1, false).unwrap();
+
+
+        state.tx.send(HttpApiCall{
+            identity,
+            headers,
+        }).unwrap();
+        String::from("{\"ok\": true}")
+    } else {
+        String::from("{\"ok\": false}")
+    }
+}
 
 
 #[osaka]
@@ -80,25 +118,65 @@ pub fn main() -> Result<(), Error> {
     }
     env_logger::init();
 
-    let (tx, rx) = channel::channel();
-    let state = MyState{tx};
-    thread::spawn(move ||{
-        server::new(
-            move || App::with_state(state.clone())
-            .route("/via/{identity}/{tail:.*}", http::Method::POST, via))
-            .bind("0.0.0.0:8052").unwrap()
-            .run();
-    });
 
-    let redis_url = env::var("REDIS").unwrap_or("redis://127.0.0.1/".to_string());
+    let redis_url = env::var("REDIS_URL").unwrap_or("redis://127.0.0.1/".to_string());
     let redis_client = redis_cluster_rs::Client::open(vec![redis_url.as_str()]).unwrap();
+    //let redis_client = redis::Client::open(redis_url.as_str()).unwrap();
     let redis_  = Arc::new(redis_client.get_connection().expect("redis"));
 
 
     let config = config::load().unwrap();
+
+
+    let mqtt = Mosquitto::new(&format!("{}", config.secret.identity()));
+
+    let mqtt_host = env::var("MQTT_HOST").unwrap_or("localhost".to_string());
+    let mqtt_port = env::var("MQTT_PORT").unwrap_or("1883".to_string()).parse().expect("parse MQTT_PORT");
+    info!("connecting to mqtt {} {}", mqtt_host, mqtt_port);
+    mqtt.connect(&mqtt_host, mqtt_port).expect("mqtt");
+
+    let mqtt_ = mqtt.clone();
+    thread::spawn(move ||{
+        mqtt_.loop_until_disconnect(200).expect("broken loop");
+    });
+
+
+
+
+
+    let (tx, rx) = channel::channel();
+    let state = MyState{tx, mqtt: mqtt.clone()};
+    thread::spawn(move ||{
+        server::new(
+            move || App::with_state(state.clone())
+            .route("/", http::Method::GET, healthcheck)
+            .route("/via/{identity}/debug/config/assimilate", http::Method::POST, assimilate)
+            .route("/via/{identity}/ota/sysupgrade", http::Method::POST, sysupgrade)
+            )
+            .bind("0.0.0.0:8052").unwrap()
+            .run();
+    });
+
+
+
     let poll = osaka::Poll::new();
     let mut conduit = Conduit::new(poll.clone(), config);
     let mut conduit = osaka::sync!(conduit)?;
+
+
+    let redis = redis_.clone();
+    let mqtt_ = mqtt.clone();
+    conduit.on_unpublish(move |identity|{
+        let t = format!(r#"{{"timestamp":{}, "state": "down", "carrier": true}}"#,
+                        SystemTime::now().duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards")
+                        .as_secs()
+                       );
+        let _ : () = redis.hset(format!("{}", identity), "up", &t).unwrap();
+        mqtt_.publish(
+            &format!("/matriarch/{}/up", identity),
+            t.as_bytes(), 1, false).unwrap();
+    });
 
     let redis = redis_.clone();
     conduit.schedule_raw(
@@ -199,7 +277,11 @@ pub fn main() -> Result<(), Error> {
                 }
             }
 
-            let _ : () = redis.hset(format!("{}", identity), "stations", serde_json::to_string(&stations).unwrap()).unwrap();
+            let t = serde_json::to_string(&stations).unwrap();
+            let _ : () = redis.hset(format!("{}", identity), "stations", &t).unwrap();
+            mqtt.publish(
+                &format!("/matriarch/{}/stations", identity),
+                t.as_bytes(), 1, false).unwrap();
 
             let t = format!(r#"{{"timestamp":{}, "state": "up", "carrier": true}}"#,
                             SystemTime::now().duration_since(UNIX_EPOCH)
@@ -207,6 +289,12 @@ pub fn main() -> Result<(), Error> {
                             .as_secs()
                             );
             let _ : () = redis.hset(format!("{}", identity), "up", &t).unwrap();
+            let _ : () = redis.expire(format!("{}", identity), 600).unwrap();
+
+            mqtt.publish(
+                &format!("/matriarch/{}/up", identity),
+                t.as_bytes(), 1, false).unwrap();
+
             println!("{} => {:#?}", identity, msg);
         }
     );
