@@ -69,6 +69,13 @@ struct PostSysupgrade {
     sha256: String,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct PrinterDisco{
+    ip:     String,
+    mac:    Option<String>,
+    port:   Option<u64>,
+}
+
 fn healthcheck(_state: State<MyState>) -> impl Responder {
     String::from("{\"ok\": true}")
 }
@@ -78,6 +85,39 @@ fn assimilate(state: State<MyState>, p: Path<(String)>) -> impl Responder {
         state.tx.send(HttpApiCall{
             identity,
             headers: carrier::headers::Headers::with_path("/v1/assimilate"),
+        }).unwrap();
+        String::from("{\"ok\": true}")
+    } else {
+        String::from("{\"ok\": false}")
+    }
+}
+
+#[derive(Deserialize)]
+struct ThingsActionHandle {
+    host: String,
+}
+
+#[derive(Deserialize)]
+struct ThingsAction {
+    text:   String,
+    action: String,
+    handle: ThingsActionHandle,
+}
+fn things_action(state: State<MyState>, p: Path<(String)>, body: actix_web::Json<ThingsAction>) -> impl Responder {
+
+    if body.action != "print" {
+        return String::from("{\"ok\": false}");
+    }
+
+    if let Ok(identity) = p.parse() {
+
+        let mut headers = carrier::headers::Headers::with_path("/v1/print");
+        headers.add("host".into(), body.handle.host.clone().into());
+        headers.add("text".into(), body.text.clone().into());
+
+        state.tx.send(HttpApiCall{
+            identity,
+            headers,
         }).unwrap();
         String::from("{\"ok\": true}")
     } else {
@@ -152,6 +192,7 @@ pub fn main() -> Result<(), Error> {
             .route("/", http::Method::GET, healthcheck)
             .route("/via/{identity}/debug/config/assimilate", http::Method::POST, assimilate)
             .route("/via/{identity}/ota/sysupgrade", http::Method::POST, sysupgrade)
+            .route("/via/{identity}/things/action", http::Method::POST, things_action)
             )
             .bind("0.0.0.0:8052").unwrap()
             .run();
@@ -172,24 +213,27 @@ pub fn main() -> Result<(), Error> {
                         .expect("Time went backwards")
                         .as_secs()
                        );
-        let _ : () = redis.hset(format!("{}", identity), "up", &t).unwrap();
+        let key = format!("{}", identity);
+        let _ : () = redis.hset(&key, "up", &t).unwrap();
         mqtt_.publish(
             &format!("/matriarch/{}/up", identity),
             t.as_bytes(), 1, false).unwrap();
+        let _ : () = redis.persist(&key).unwrap();
     });
 
     let redis = redis_.clone();
     conduit.schedule_raw(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         carrier::headers::Headers::with_path("/v1/unixbus"),
         move |identity: &carrier::identity::Identity, msg: Vec<u8>| {
+            println!("{} => /v1/unixbus", identity);
+
             let msg = String::from_utf8_lossy(&msg);
             let msg : Vec<&str> = msg.split_terminator("\n").collect();
             if msg.len() > 1 && msg[0] == "/odhcpd"{
                 let msg = msg[1..].join("\n");
                 match serde_json::from_str::<Odhcp>(&msg) {
                     Ok(v) => {
-                        println!("{:?}", v);
                         for v in v.public{
                             let key = format!("{}:dhcp:{}", identity, v.m);
                             let l = v.l.parse().unwrap_or(60000);
@@ -221,16 +265,55 @@ pub fn main() -> Result<(), Error> {
                 }
             }
 
-            println!("{} => {:#?}", identity, msg);
         }
     );
 
 
     let redis = redis_.clone();
+    let mqtt_ = mqtt.clone();
+    conduit.schedule_raw(
+        Duration::from_secs(30),
+        carrier::headers::Headers::with_path("/v1/printers"),
+        move |identity: &carrier::identity::Identity, msg: Vec<u8> | {
+            println!("{} => /v1/printers", identity);
+            match serde_json::from_slice::<HashMap<String, PrinterDisco>>(&msg) {
+                Err(e) => {
+                    println!("{}", e);
+                },
+                Ok(v) => {
+                    let mut stations = Vec::new();
+                    for (_,v) in v {
+                        let mac = v.mac.unwrap_or(String::new()).clone();
+                        let hwa : Vec<u8> = mac.as_bytes().chunks(2)
+                            .map(|b|u8::from_str_radix(&String::from_utf8_lossy(b),16).unwrap_or(0)).collect();
+                        let hwa = hwaddr::HwAddr::from(&hwa[..]);
+                        let station = uitypes::Station {
+                            vendor: hwa.producer().map(|p|p.name.to_string()),
+                            mac,
+                            port: v.port,
+                            ip: Some(v.ip),
+                            host_name: None,
+                            signal: None,
+                            signal_avg: None,
+                            radio: None,
+                        };
+                        stations.push(station);
+                    }
+                    let t = serde_json::to_string(&stations).unwrap();
+                    let _ : () = redis.hset(format!("{}", identity), "printers", &t).unwrap();
+                    mqtt_.publish(
+                        &format!("/matriarch/{}/printers", identity),
+                        t.as_bytes(), 1, false).unwrap();
+                }
+            }
+        });
+
+    let redis = redis_.clone();
     conduit.schedule(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         carrier::headers::Headers::with_path("/v1/netsurvey"),
         move |identity: &carrier::identity::Identity, msg: carrier::proto::NetSurvey| {
+            println!("{} => /v1/netsurvey", identity);
 
             let mut stations = HashMap::new();
 
@@ -261,7 +344,8 @@ pub fn main() -> Result<(), Error> {
                             Some("a".to_string())
                         } else {
                             None
-                        }
+                        },
+                        port: None,
                     };
 
                     let zone : Vec<&str> = i.name.split("-").collect();;
@@ -295,7 +379,6 @@ pub fn main() -> Result<(), Error> {
                 &format!("/matriarch/{}/up", identity),
                 t.as_bytes(), 1, false).unwrap();
 
-            println!("{} => {:#?}", identity, msg);
         }
     );
 

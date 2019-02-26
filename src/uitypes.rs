@@ -32,6 +32,7 @@ pub struct Station{
     pub signal:         Option<i32>,
     #[serde(rename="signal avg")]
     pub signal_avg:     Option<i32>,
+    pub port:           Option<u64>
 }
 
 
